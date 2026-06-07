@@ -1,0 +1,13 @@
+[package]
+name = "supraclaw"
+version = "1.0.0"
+authors = ["supraclaw"]
+
+[addresses]
+supraclaw   = "0x939132a494abe660f78a4a2cfcb1a8a8c1f8655154d9e0feee904afe74d614a5"
+dev_address = "0x939132a494abe660f78a4a2cfcb1a8a8c1f8655154d9e0feee904afe74d614a5"
+
+[dependencies.SupraFramework]
+git = "https://github.com/Entropy-Foundation/aptos-core.git"
+rev = "supra-mainnet"
+subdir = "aptos-move/framework/supra-framework"
