@@ -1,6 +1,9 @@
 [build]
-  command = "pnpm install && pnpm --filter @workspace/supraclaw run build"
+  command = "pnpm --filter @workspace/supraclaw run build"
   publish = "artifacts/supraclaw/dist/public"
+
+[build.environment]
+  PNPM_VERSION = "9"
 
 [[redirects]]
   from = "/*"
