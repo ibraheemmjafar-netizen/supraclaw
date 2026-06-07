@@ -1,7 +1,0 @@
-﻿{
-  "buildCommand": "pnpm install --frozen-lockfile && pnpm --filter @workspace/supraclaw run build",
-  "outputDirectory": "artifacts/supraclaw/dist/public",
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
-  ]
-}
