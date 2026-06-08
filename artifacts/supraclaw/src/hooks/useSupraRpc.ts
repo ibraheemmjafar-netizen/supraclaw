@@ -1,19 +1,27 @@
 /**
  * useSupraRpc.ts
- * Scans connected wallet for all burnable assets via Supra REST API.
- * Detects: legacy CoinStore tokens, FA tokens, and v1 NFTs (TokenStore events).
+ * Scans a connected Supra wallet for burnable tokens and NFTs.
+ *
+ * Verified flow:
+ *  1. GET /rpc/v1/accounts/{addr}/resources  → find all CoinStore<T> types
+ *  2. POST /rpc/v1/view 0x1::coin::balance   → get balance per coin (parallel)
+ *  3. POST /rpc/v1/view 0x1::coin::name      → get human name per coin (parallel)
+ *  4. POST /rpc/v1/view 0x1::coin::decimals  → get decimals per coin (parallel)
+ *  5. GET deposit_events on TokenStore       → discover v1 NFTs
  */
 
 import { useState, useEffect, useCallback } from "react";
 import { useWallet } from "@/contexts/WalletContext";
 import {
   fetchAccountResources,
-  fetchTokenEvents,
-  parseCoinResources,
-  parseFaResources,
-  resolveFaMetadata,
-  parseTokenStore,
-  OCTAS_PER_SUPRA,
+  getCoinStoreResources,
+  extractCoinType,
+  fetchCoinBalance,
+  fetchCoinName,
+  fetchCoinSymbol,
+  fetchCoinDecimals,
+  hasTokenStore,
+  fetchV1NftDepositEvents,
 } from "@/lib/supraTransaction";
 
 export interface BurnableAsset {
@@ -30,17 +38,16 @@ export interface BurnableAsset {
   objectAddress?: string;
 }
 
-// ─── Mock data (preview/demo mode) ───────────────────────────────────────────
+// ─── Mock data (demo / wallet not connected) ──────────────────────────────────
 
 const MOCK_TOKENS: BurnableAsset[] = [
-  { id: "mock-1", name: "PEPE", symbol: "PEPE", balance: 420000, rawBalance: "420000000000", decimals: 6, estimatedRebate: 0.00234, type: "fungible", coinType: "0xATMOS::pepe::PEPE" },
-  { id: "mock-2", name: "DOGE", symbol: "DOGE", balance: 1337, rawBalance: "1337000000", decimals: 6, estimatedRebate: 0.00156, type: "fungible", coinType: "0xATMOS::doge::DOGE" },
-  { id: "mock-3", name: "WIF",  symbol: "WIF",  balance: 9999, rawBalance: "9999000000", decimals: 6, estimatedRebate: 0.00112, type: "fungible", coinType: "0xATMOS::wif::WIF" },
+  { id: "mock-1", name: "SUPRA OG", symbol: "OG", balance: 8023, rawBalance: "8023", decimals: 6, estimatedRebate: 0.001, type: "fungible", coinType: "0xd0f37da5c7a0104d8cb161e1ac1e101f90b702c18081b76b62f20137bf40fd0b::OG::OG" },
+  { id: "mock-2", name: "LEO", symbol: "LEO", balance: 5000, rawBalance: "5000000000", decimals: 6, estimatedRebate: 0.001, type: "fungible", coinType: "0x83e6ebf0e08121734b117daf65677c77185e151114364f7c53bc2366f2c64a12::LEO::LEO" },
+  { id: "mock-3", name: "DAWGZ", symbol: "DAWGZ", balance: 420, rawBalance: "420000000", decimals: 6, estimatedRebate: 0.001, type: "fungible", coinType: "0xb8e94e7204d8eeb565a653d262ae6f7434a3a452e2aaf624810b33dfa3b64d09::DAWGZ::DAWGZ" },
 ];
 
 const MOCK_NFTS: BurnableAsset[] = [
-  { id: "mock-nft-1", name: "Crystara #4201", collection: "Crystara Genesis", estimatedRebate: 0.00512, type: "nft", balance: 1, rawBalance: "1", decimals: 0, objectAddress: "0xCRYSTARA0004201" },
-  { id: "mock-nft-2", name: "Crystara #0042", collection: "Crystara Void",    estimatedRebate: 0.00389, type: "nft", balance: 1, rawBalance: "1", decimals: 0, objectAddress: "0xCRYSTARA0000042" },
+  { id: "mock-nft-1", name: "Crystara #4201", collection: "Crystara Genesis", estimatedRebate: 0.005, type: "nft", balance: 1, rawBalance: "1", decimals: 0 },
 ];
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -54,7 +61,7 @@ export function useSupraRpc() {
   const scanWallet = useCallback(async () => {
     if (!connected || !address) {
       setLoading(true);
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, 600));
       setAssets([...MOCK_TOKENS, ...MOCK_NFTS]);
       setLoading(false);
       return;
@@ -64,125 +71,80 @@ export function useSupraRpc() {
     setScanError(null);
 
     try {
-      // ── 1. Fetch all resources on account ──────────────────────────────────
+      // Step 1: fetch all resources
       const resources = await fetchAccountResources(address, network);
-      console.log(`[supraclaw] fetched ${resources.length} resources for ${address}`);
+      console.log(`[supraclaw] ${resources.length} resources found for ${address}`);
 
-      // ── 2. Parse legacy CoinStore tokens ──────────────────────────────────
-      const coinResults = parseCoinResources(resources);
-      const fungibles: BurnableAsset[] = coinResults.map((c, i) => ({
-        id: `coin-${i}-${c.coinType}`,
-        name: c.name,
-        symbol: c.name,
-        balance: c.balance / OCTAS_PER_SUPRA,
-        rawBalance: c.rawBalance,
-        decimals: 8,
-        estimatedRebate: c.estimatedRebate,
-        type: "fungible" as const,
-        coinType: c.coinType,
-      }));
+      // Step 2: filter to CoinStore resources (non-SUPRA)
+      const coinStores = getCoinStoreResources(resources);
+      console.log(`[supraclaw] ${coinStores.length} CoinStore resources`);
 
-      // ── 3. Parse Fungible Asset (FA) resources ────────────────────────────
-      // Atmos tokens use FA standard — these appear as FungibleStore resources
-      // if Supra stores them on the account, or we discover them via the API.
-      const faRaw = parseFaResources(resources);
-      const faTokens: BurnableAsset[] = await Promise.all(
-        faRaw.map(async (fa, i) => {
-          const meta = await resolveFaMetadata(fa.metadataAddress, network);
-          return {
-            id: `fa-${i}-${fa.metadataAddress}`,
-            name: meta.name,
-            symbol: meta.symbol,
-            balance: fa.balance / Math.pow(10, meta.decimals),
-            rawBalance: fa.rawBalance,
-            decimals: meta.decimals,
-            estimatedRebate: fa.estimatedRebate,
-            type: "fungible" as const,
-            coinType: fa.metadataAddress, // FA uses metadata address as identifier
-          };
-        })
-      );
+      // Step 3: for each coin, fetch balance + name + symbol + decimals in parallel
+      const fungibles: BurnableAsset[] = (
+        await Promise.all(
+          coinStores.map(async (r, i) => {
+            const coinType = extractCoinType(r);
+            if (!coinType) return null;
 
-      // ── 4. Parse v1 NFTs from TokenStore deposit events ───────────────────
-      // 0x3::token::TokenStore IS a resource directly on the account.
-      // We fetch deposit events to discover which tokens are owned.
-      const nfts: BurnableAsset[] = [];
-      const tokenStoreInfo = parseTokenStore(resources);
+            const [balance, name, symbol, decimals] = await Promise.all([
+              fetchCoinBalance(coinType, address, network),
+              fetchCoinName(coinType, network),
+              fetchCoinSymbol(coinType, network),
+              fetchCoinDecimals(coinType, network),
+            ]);
 
-      if (tokenStoreInfo) {
-        const depositEvents = await fetchTokenEvents(
-          address,
-          network,
-          tokenStoreInfo.depositEventHandle,
-          100
-        );
-        const withdrawEvents = await fetchTokenEvents(
-          address,
-          network,
-          tokenStoreInfo.withdrawEventHandle,
-          100
-        );
+            if (balance === 0) return null; // skip empty stores
 
-        // Track deposits and subtract withdrawals to find currently owned NFTs
-        const depositedIds = new Set<string>();
-        const withdrawnIds = new Set<string>();
-
-        interface TokenEvent {
-          data?: {
-            id?: {
-              token_data_id?: {
-                creator?: string;
-                collection?: string;
-                name?: string;
-              };
-              property_version?: string;
+            return {
+              id: `coin-${i}-${coinType}`,
+              name,
+              symbol,
+              balance: balance / Math.pow(10, decimals),
+              rawBalance: balance.toString(),
+              decimals,
+              estimatedRebate: 0.001, // ~0.001 SUPRA per coin slot freed
+              type: "fungible" as const,
+              coinType,
             };
-          };
-        }
+          })
+        )
+      ).filter((x): x is BurnableAsset => x !== null);
 
-        const tokenId = (event: TokenEvent): string => {
-          const d = event?.data?.id?.token_data_id;
-          return `${d?.creator ?? ""}::${d?.collection ?? ""}::${d?.name ?? ""}::${event?.data?.id?.property_version ?? "0"}`;
-        };
+      console.log(`[supraclaw] ${fungibles.length} non-zero tokens`);
 
-        for (const ev of depositEvents) withdrawnIds.delete(tokenId(ev as TokenEvent)) || depositedIds.add(tokenId(ev as TokenEvent));
-        for (const ev of withdrawEvents) withdrawnIds.add(tokenId(ev as TokenEvent));
-
-        let nftIdx = 0;
-        for (const ev of depositEvents) {
-          const id = tokenId(ev as TokenEvent);
-          if (withdrawnIds.has(id)) continue;
-          if (!depositedIds.has(id)) continue;
-          depositedIds.delete(id); // deduplicate
-
-          const d = (ev as TokenEvent)?.data?.id?.token_data_id;
+      // Step 4: fetch v1 NFTs from TokenStore deposit events
+      const nfts: BurnableAsset[] = [];
+      if (hasTokenStore(resources)) {
+        const nftEvents = await fetchV1NftDepositEvents(address, network, 100);
+        // Deduplicate by name+collection (deposit events may repeat)
+        const seen = new Set<string>();
+        nftEvents.forEach((ev, i) => {
+          const key = `${ev.collection}::${ev.name}::${ev.propertyVersion}`;
+          if (seen.has(key)) return;
+          seen.add(key);
           nfts.push({
-            id: `nft-event-${nftIdx++}`,
-            name: d?.name ?? "Unknown NFT",
-            collection: d?.collection ?? "Unknown Collection",
+            id: `nft-${i}-${key}`,
+            name: ev.name,
+            collection: ev.collection,
             estimatedRebate: 0.004,
             type: "nft",
             balance: 1,
             rawBalance: "1",
             decimals: 0,
-            // Object address not directly available from v1 token events;
-            // use creator+collection+name as a composite key for the burn payload
-            objectAddress: `${d?.creator ?? ""}::${d?.collection ?? ""}::${d?.name ?? ""}`,
+            objectAddress: `${ev.creator}::${ev.collection}::${ev.name}`,
           });
-        }
+        });
+        console.log(`[supraclaw] ${nfts.length} v1 NFTs found`);
       }
 
-      const all = [...fungibles, ...faTokens, ...nfts];
-      console.log(`[supraclaw] found ${fungibles.length} legacy coins, ${faTokens.length} FA tokens, ${nfts.length} NFTs`);
-      setAssets(all);
+      setAssets([...fungibles, ...nfts]);
 
-      if (all.length === 0) {
-        setScanError("No burnable assets found. This wallet may hold assets in a format not yet supported (e.g. v2 digital assets require the Supra indexer).");
+      if (fungibles.length === 0 && nfts.length === 0) {
+        setScanError("No burnable assets found in this wallet.");
       }
     } catch (err) {
-      console.error("[supraclaw] scan failed:", err);
+      console.error("[supraclaw] scan error:", err);
       setScanError(err instanceof Error ? err.message : "Scan failed");
-      // Don't fall back to mock — show empty with error so user knows
       setAssets([]);
     } finally {
       setLoading(false);
@@ -195,7 +157,6 @@ export function useSupraRpc() {
 
   const tokens = assets.filter((a) => a.type === "fungible");
   const nfts = assets.filter((a) => a.type === "nft");
-
   const removeAssets = (ids: string[]) =>
     setAssets((prev) => prev.filter((a) => !ids.includes(a.id)));
 
