@@ -1,11 +1,7 @@
 [build]
   command = "pnpm --filter @workspace/supraclaw run build"
-  publish = "artifacts/supraclaw/dist/public"
+  publish = "artifacts/supraclaw/dist"
 
 [build.environment]
-  PNPM_VERSION = "9"
-
-[[redirects]]
-  from = "/*"
-  to = "/index.html"
-  status = 200
+  NODE_VERSION = "24"
+  PNPM_VERSION = "10"
