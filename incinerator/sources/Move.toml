@@ -1,0 +1,10 @@
+[package]
+name = "incinerator"
+version = "1.0.0"
+
+[addresses]
+# Replace with your address from: supra profile new incinerator
+incinerator = "_"
+
+[dependencies]
+SupraFramework = { local = "/supra/move_templates/framework/supra-framework" }

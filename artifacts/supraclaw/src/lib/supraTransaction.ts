@@ -1,27 +1,36 @@
 /**
  * supraTransaction.ts
  *
- * VERIFIED against Supra mainnet RPC.
+ * VERIFIED against Supra mainnet 2026-06-09.
  *
- * API facts (tested 2026-06-08):
- *  - Use /rpc/v2/ — gives {resources:[{type,data}]} with real balances in data.coin.value
- *  - /rpc/v1/ resources gives type metadata ONLY (no balances)
- *  - StarKey sendTransaction uses {data:{function,typeArguments,functionArguments}} format
- *  - Incinerator contract must be deployed separately; until then we use coin::transfer to dev
+ * Confirmed facts:
+ *  - RPC v2: GET /rpc/v2/accounts/{addr}/resources → {resources:[{type,data}]}
+ *  - Balance: data.coin.value (string, e.g. "8023")
+ *  - CoinStore type: "0x1::coin::CoinStore<0xADDR::MODULE::NAME>"
+ *  - SupraCoin: "0x1::supra_coin::SupraCoin"
+ *  - StarKey payload: {type:"entry_function_payload", function, type_arguments, arguments}
+ *    (matches what gets stored on-chain — verified from real tx history)
+ *  - View functions: POST /rpc/v1/view → {result:[value]}
  */
 
 export const DEV_ADDRESS =
   "0x939132a494abe660f78a4a2cfcb1a8a8c1f8655154d9e0feee904afe74d614a5";
 
-// Set this once the incinerator Move module is deployed to mainnet
+/**
+ * Once the incinerator Move module is deployed, set this to its address.
+ * Until then, burn_coin falls back to a plain coin::transfer to DEV_ADDRESS.
+ */
 export const INCINERATOR_ADDRESS: string | null = null;
 
-export const DEV_FEE_BPS = 500; // 5%
+export const DEV_FEE_BPS = 500;
 export const BPS_DENOMINATOR = 10_000;
-export const SUPRA_DECIMALS = 8;
-export const OCTAS_PER_SUPRA = 10 ** SUPRA_DECIMALS;
-// Estimated SUPRA storage deposit freed per CoinStore slot (empirical ~0.001 SUPRA on Supra)
+
+/** Storage deposit returned per slot closed (empirical Supra value ≈ 0.001 SUPRA) */
 export const SUPRA_PER_SLOT = 0.001;
+
+/** 8 decimals for SUPRA native coin */
+export const SUPRA_DECIMALS = 8;
+export const OCTAS_PER_SUPRA = Math.pow(10, SUPRA_DECIMALS);
 
 export const RPC_MAINNET = "https://rpc-mainnet.supra.com";
 export const RPC_TESTNET = "https://rpc-testnet.supra.com";
@@ -37,18 +46,11 @@ export function calculateFee(estimatedRebateSupra: number) {
   return { devFee, netAmount, devFeeOctas };
 }
 
-// ─── RPC v2 resource types ────────────────────────────────────────────────────
-// GET /rpc/v2/accounts/{addr}/resources → {resources:[{type:string, data:{...}}], cursor?:string}
-
 export interface V2Resource {
   type: string;
   data: Record<string, unknown>;
 }
 
-/**
- * Fetch all account resources using RPC v2 (includes actual data/balances).
- * Paginates automatically.
- */
 export async function fetchAccountResources(
   address: string,
   network: "mainnet" | "testnet"
@@ -58,80 +60,61 @@ export async function fetchAccountResources(
   let cursor: string | null = null;
 
   for (let page = 0; page < 20; page++) {
-    const url = cursor
-      ? `${rpc}/rpc/v2/accounts/${address}/resources?cursor=${encodeURIComponent(cursor)}&limit=100`
-      : `${rpc}/rpc/v2/accounts/${address}/resources?limit=100`;
-
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Supra RPC v2 ${res.status}: ${await res.text()}`);
-    const json = await res.json() as { resources?: V2Resource[]; cursor?: string };
-
-    const resources = json.resources ?? [];
-    all.push(...resources);
-
+    const qs = cursor ? `?cursor=${encodeURIComponent(cursor)}&limit=100` : "?limit=100";
+    const res = await fetch(`${rpc}/rpc/v2/accounts/${address}/resources${qs}`);
+    if (!res.ok) throw new Error(`Supra RPC v2 ${res.status}`);
+    const json = (await res.json()) as { resources?: V2Resource[]; cursor?: string };
+    const chunk = json.resources ?? [];
+    all.push(...chunk);
     cursor = json.cursor ?? null;
-    if (!cursor || resources.length === 0) break;
+    if (!cursor || chunk.length === 0) break;
   }
 
   return all;
 }
 
-// ─── Coin helpers (v2) ────────────────────────────────────────────────────────
-
-/**
- * Filter to non-SUPRA CoinStore resources.
- * v2 types use short form: "0x1::coin::CoinStore<0xADDR::MODULE::NAME>"
- */
-export function getCoinStoreResources(resources: V2Resource[]): V2Resource[] {
-  return resources.filter((r) => {
-    if (!r.type.includes("::coin::CoinStore<")) return false;
-    // Skip native SUPRA
-    const inner = extractCoinType(r);
-    if (!inner) return false;
-    if (inner.includes("::supra_coin::SupraCoin")) return false;
-    return true;
-  });
+export function extractCoinType(r: V2Resource): string | null {
+  const m = r.type.match(/CoinStore<(.+)>$/);
+  return m ? m[1] : null;
 }
 
-/**
- * Extract coin type string from CoinStore resource type.
- * "0x1::coin::CoinStore<0xd0f37da...::OG::OG>" → "0xd0f37da...::OG::OG"
- */
-export function extractCoinType(resource: V2Resource): string | null {
-  const match = resource.type.match(/CoinStore<(.+)>$/);
-  return match ? match[1] : null;
-}
-
-/**
- * Get balance directly from v2 resource data — no view function needed.
- * data.coin.value is a string like "8023"
- */
-export function getCoinBalance(resource: V2Resource): number {
-  const coin = resource.data?.coin as { value?: string } | undefined;
+export function getCoinBalance(r: V2Resource): number {
+  const coin = r.data?.coin as { value?: string } | undefined;
   return parseInt(coin?.value ?? "0", 10);
 }
 
-/** Get display name from coin type: "0x...::OG::OG" → "OG" */
 export function coinTypeName(coinType: string): string {
   const parts = coinType.split("::");
   return parts[parts.length - 1] ?? coinType;
 }
 
-/** Fetch coin metadata (name, symbol, decimals) via view functions. */
+/** Return ALL non-SUPRA CoinStore resources — both non-zero AND zero-balance dead slots */
+export function getCoinStoreResources(resources: V2Resource[]): V2Resource[] {
+  return resources.filter((r) => {
+    if (!r.type.includes("::coin::CoinStore<")) return false;
+    const inner = extractCoinType(r);
+    return !!inner && !inner.includes("::supra_coin::SupraCoin");
+  });
+}
+
+export function isDeadSlot(r: V2Resource): boolean {
+  return getCoinBalance(r) === 0;
+}
+
 export async function fetchCoinMeta(
   coinType: string,
   network: "mainnet" | "testnet"
 ): Promise<{ name: string; symbol: string; decimals: number }> {
   const rpc = getRpcUrl(network);
-  const call = async (fn: string, args: string[] = []) => {
+  const view = async (fn: string): Promise<unknown> => {
     try {
       const res = await fetch(`${rpc}/rpc/v1/view`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ function: fn, type_arguments: [coinType], arguments: args }),
+        body: JSON.stringify({ function: fn, type_arguments: [coinType], arguments: [] }),
       });
       if (!res.ok) return null;
-      const j = await res.json() as { result?: unknown[] };
+      const j = (await res.json()) as { result?: unknown[] };
       return j.result?.[0] ?? null;
     } catch {
       return null;
@@ -139,19 +122,19 @@ export async function fetchCoinMeta(
   };
 
   const [name, symbol, decimals] = await Promise.all([
-    call("0x1::coin::name"),
-    call("0x1::coin::symbol"),
-    call("0x1::coin::decimals"),
+    view("0x1::coin::name"),
+    view("0x1::coin::symbol"),
+    view("0x1::coin::decimals"),
   ]);
 
+  const fb = coinTypeName(coinType);
   return {
-    name: (name as string) || coinTypeName(coinType),
-    symbol: (symbol as string) || coinTypeName(coinType),
+    name: typeof name === "string" && name ? name.trim() : fb,
+    symbol: typeof symbol === "string" && symbol ? symbol.trim() : fb,
     decimals: typeof decimals === "number" ? decimals : 6,
   };
 }
 
-/** Fetch SUPRA native balance for header display. */
 export async function fetchSupraBalance(
   address: string,
   network: "mainnet" | "testnet"
@@ -167,183 +150,89 @@ export async function fetchSupraBalance(
         arguments: [address],
       }),
     });
-    const j = await res.json() as { result?: unknown[] };
+    const j = (await res.json()) as { result?: unknown[] };
     return parseInt(j.result?.[0] as string, 10) / OCTAS_PER_SUPRA;
   } catch {
     return 0;
   }
 }
 
-// ─── NFT (v1 TokenStore via transaction history) ─────────────────────────────
-
-export interface V1Nft {
-  creator: string;
-  collection: string;
-  name: string;
-  propertyVersion: string;
-}
-
-/** Check if account has a v1 TokenStore (= has v1 NFTs). */
 export function hasTokenStore(resources: V2Resource[]): boolean {
-  return resources.some((r) =>
-    r.type === "0x3::token::TokenStore" ||
-    r.type.includes("::token::TokenStore")
-  );
+  return resources.some((r) => r.type.includes("::token::TokenStore"));
 }
 
 /**
- * Discover v1 NFTs by parsing recent transaction arguments.
- * This works because list_token / offer_token / transfer_token calls
- * embed collection name and token name as BCS hex-encoded strings.
+ * Estimate NFT count from TokenStore deposit/withdraw counters.
+ * Cannot enumerate individual NFTs — Supra events/table APIs return empty for this wallet.
  */
-export async function fetchNftsFromTransactions(
-  address: string,
-  network: "mainnet" | "testnet",
-  limit = 100
-): Promise<V1Nft[]> {
-  const rpc = getRpcUrl(network);
-  try {
-    const res = await fetch(
-      `${rpc}/rpc/v1/accounts/${address}/transactions?limit=${limit}`
-    );
-    if (!res.ok) return [];
-    const json = await res.json() as { record?: unknown[] };
-    const txs = json.record ?? [];
-
-    const nfts: V1Nft[] = [];
-    const seen = new Set<string>();
-
-    for (const tx of txs) {
-      const payload = (tx as Record<string, unknown>)?.["payload"];
-      const move = (payload as Record<string, unknown>)?.["Move"];
-      if (!move) continue;
-
-      const fn = (move as Record<string, unknown>).function as string ?? "";
-      const args = (move as Record<string, unknown>).arguments as string[] ?? [];
-
-      // Supra token marketplace / token module transactions
-      // arg pattern: [creator_or_market_addr, collection_hex, name_hex, ...]
-      if (
-        fn.includes("::token") ||
-        fn.includes("::token0x3") ||
-        fn.includes("offer_token") ||
-        fn.includes("transfer_token") ||
-        fn.includes("list_token") ||
-        fn.includes("direct_transfer")
-      ) {
-        if (args.length >= 3) {
-          const collection = hexToUtf8(args[1]);
-          const name = hexToUtf8(args[2]);
-          const creator = args[0];
-          if (collection && name) {
-            const key = `${creator}::${collection}::${name}`;
-            if (!seen.has(key)) {
-              seen.add(key);
-              nfts.push({ creator, collection, name, propertyVersion: "0" });
-            }
-          }
-        }
-      }
-    }
-
-    return nfts;
-  } catch {
-    return [];
-  }
+export function estimateNftCount(resources: V2Resource[]): number {
+  const ts = resources.find((r) => r.type.includes("::token::TokenStore"));
+  if (!ts) return 0;
+  const dep = parseInt(
+    ((ts.data?.deposit_events as { counter?: string })?.counter) ?? "0", 10
+  );
+  const with_ = parseInt(
+    ((ts.data?.withdraw_events as { counter?: string })?.counter) ?? "0", 10
+  );
+  return Math.max(0, dep - with_);
 }
-
-/** Decode a BCS-encoded hex string argument to UTF-8. */
-function hexToUtf8(hex: string): string {
-  if (!hex || !hex.startsWith("0x")) return "";
-  try {
-    const bytes = Buffer.from(hex.slice(2), "hex");
-    // BCS strings are prefixed with ULEB128 length — try to strip it
-    // Simple heuristic: if first byte looks like a length prefix, skip it
-    if (bytes.length > 1 && bytes[0] < 128 && bytes[0] === bytes.length - 1) {
-      return bytes.slice(1).toString("utf8");
-    }
-    return bytes.toString("utf8");
-  } catch {
-    return "";
-  }
-}
-
-// ─── Transaction builders ────────────────────────────────────────────────────
 
 /**
- * Build a coin transfer payload.
+ * Build StarKey sendTransaction payload.
+ * Format verified from real Supra on-chain transactions:
+ *   {type:"entry_function_payload", function, type_arguments, arguments}
  *
- * Uses StarKey's newer Aptos wallet standard format:
- * {data: {function, typeArguments, functionArguments}}
- *
- * Until the Incinerator Move contract is deployed, we transfer coins to the
- * dev address. The dev manually sends SUPRA rebates back to users.
- *
- * When INCINERATOR_ADDRESS is set (contract deployed), switch to:
- *   function: `${INCINERATOR_ADDRESS}::incinerator::burn_and_rebate`
- *   functionArguments: [amount, devFeeOctas.toString()]
+ * Phase 1 (INCINERATOR_ADDRESS = null): plain coin::transfer to dev
+ * Phase 2 (INCINERATOR_ADDRESS set): calls deployed incinerator contract
  */
 export function buildBurnCoinPayload(
   coinType: string,
   rawBalance: string,
-  _devFeeOctas: number
+  devFeeOctas: number
 ): object {
+  if (INCINERATOR_ADDRESS) {
+    return {
+      type: "entry_function_payload",
+      function: `${INCINERATOR_ADDRESS}::incinerator::burn_coin`,
+      type_arguments: [coinType],
+      arguments: [INCINERATOR_ADDRESS, rawBalance],
+    };
+  }
   return {
-    data: {
-      function: "0x1::coin::transfer",
-      typeArguments: [coinType],
-      // Transfer full balance to dev address; dev sends rebate back off-chain
-      functionArguments: [DEV_ADDRESS, rawBalance],
-    },
+    type: "entry_function_payload",
+    function: "0x1::coin::transfer",
+    type_arguments: [coinType],
+    arguments: [DEV_ADDRESS, rawBalance],
   };
 }
 
-/**
- * Submit a transaction via the connected StarKey wallet.
- * StarKey injects `window.starkey.supra` and handles signing + submission.
- */
+export function buildBurnEmptySlotPayload(coinType: string): object | null {
+  if (!INCINERATOR_ADDRESS) return null;
+  return {
+    type: "entry_function_payload",
+    function: `${INCINERATOR_ADDRESS}::incinerator::burn_empty_slot`,
+    type_arguments: [coinType],
+    arguments: [INCINERATOR_ADDRESS],
+  };
+}
+
 export async function submitTransaction(payload: object): Promise<{ hash: string }> {
-  type StarKey = {
+  type StarKeyProvider = {
     supra: {
       sendTransaction: (p: object) => Promise<string | { hash?: string; txHash?: string }>;
     };
   };
-  const starkey = (window as Window & { starkey?: StarKey }).starkey;
-  if (!starkey?.supra) throw new Error("StarKey wallet not found. Please install it.");
+  const starkey = (window as Window & { starkey?: StarKeyProvider }).starkey;
+  if (!starkey?.supra?.sendTransaction) {
+    throw new Error("StarKey wallet not found. Please install it from starkey.network.");
+  }
   const result = await starkey.supra.sendTransaction(payload);
-  // StarKey may return a tx hash string OR an object
   if (typeof result === "string") return { hash: result };
   return { hash: result.hash ?? result.txHash ?? String(result) };
 }
 
-export async function burnAssets(assets: Array<{
-  type: "fungible" | "nft";
-  coinType?: string;
-  rawBalance?: string;
-  estimatedRebate: number;
-}>): Promise<{ txHash: string; totalDevFeeOctas: number }> {
-  let lastHash = "";
-  let totalDevFeeOctas = 0;
-
-  for (const asset of assets) {
-    const { devFeeOctas } = calculateFee(asset.estimatedRebate);
-    totalDevFeeOctas += devFeeOctas;
-
-    if (asset.type === "fungible" && asset.coinType && asset.rawBalance) {
-      const payload = buildBurnCoinPayload(asset.coinType, asset.rawBalance, devFeeOctas);
-      const result = await submitTransaction(payload);
-      lastHash = result.hash;
-    }
-    // NFT burn: add when incinerator contract is deployed
-  }
-
-  return { txHash: lastHash, totalDevFeeOctas };
-}
-
 export function getExplorerTxUrl(txHash: string, network: "mainnet" | "testnet"): string {
   const base =
-    network === "mainnet"
-      ? "https://suprascan.io/tx"
-      : "https://testnet.suprascan.io/tx";
+    network === "mainnet" ? "https://suprascan.io/tx" : "https://testnet.suprascan.io/tx";
   return `${base}/${txHash}`;
 }

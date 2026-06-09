@@ -34,3 +34,6 @@ onlyBuiltDependencies:
   - '@swc/core'
   - esbuild
   - msw
+
+allowBuilds:
+  esbuild: set this to true or false
