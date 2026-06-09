@@ -3,32 +3,24 @@
  *
  * VERIFIED against Supra mainnet 2026-06-09.
  *
- * Confirmed facts:
  *  - RPC v2: GET /rpc/v2/accounts/{addr}/resources → {resources:[{type,data}]}
  *  - Balance: data.coin.value (string, e.g. "8023")
  *  - CoinStore type: "0x1::coin::CoinStore<0xADDR::MODULE::NAME>"
  *  - SupraCoin: "0x1::supra_coin::SupraCoin"
  *  - StarKey payload: {type:"entry_function_payload", function, type_arguments, arguments}
- *    (matches what gets stored on-chain — verified from real tx history)
  *  - View functions: POST /rpc/v1/view → {result:[value]}
  */
 
 export const DEV_ADDRESS =
   "0x939132a494abe660f78a4a2cfcb1a8a8c1f8655154d9e0feee904afe74d614a5";
 
-/**
- * Once the incinerator Move module is deployed, set this to its address.
- * Until then, burn_coin falls back to a plain coin::transfer to DEV_ADDRESS.
- */
-export const INCINERATOR_ADDRESS: string | null = null;
+export const INCINERATOR_ADDRESS: string | null =
+  "0x2ac3ca0735187091bb84f80a3c72b7f0042f6f83ca89415e911717feb58ee197";
 
 export const DEV_FEE_BPS = 500;
 export const BPS_DENOMINATOR = 10_000;
 
-/** Storage deposit returned per slot closed (empirical Supra value ≈ 0.001 SUPRA) */
 export const SUPRA_PER_SLOT = 0.001;
-
-/** 8 decimals for SUPRA native coin */
 export const SUPRA_DECIMALS = 8;
 export const OCTAS_PER_SUPRA = Math.pow(10, SUPRA_DECIMALS);
 
@@ -60,16 +52,20 @@ export async function fetchAccountResources(
   let cursor: string | null = null;
 
   for (let page = 0; page < 20; page++) {
-    const qs = cursor ? `?cursor=${encodeURIComponent(cursor)}&limit=100` : "?limit=100";
+    const qs = cursor
+      ? `?cursor=${encodeURIComponent(cursor)}&limit=100`
+      : "?limit=100";
     const res = await fetch(`${rpc}/rpc/v2/accounts/${address}/resources${qs}`);
     if (!res.ok) throw new Error(`Supra RPC v2 ${res.status}`);
-    const json = (await res.json()) as { resources?: V2Resource[]; cursor?: string };
+    const json = (await res.json()) as {
+      resources?: V2Resource[];
+      cursor?: string;
+    };
     const chunk = json.resources ?? [];
     all.push(...chunk);
     cursor = json.cursor ?? null;
     if (!cursor || chunk.length === 0) break;
   }
-
   return all;
 }
 
@@ -88,7 +84,6 @@ export function coinTypeName(coinType: string): string {
   return parts[parts.length - 1] ?? coinType;
 }
 
-/** Return ALL non-SUPRA CoinStore resources — both non-zero AND zero-balance dead slots */
 export function getCoinStoreResources(resources: V2Resource[]): V2Resource[] {
   return resources.filter((r) => {
     if (!r.type.includes("::coin::CoinStore<")) return false;
@@ -111,7 +106,11 @@ export async function fetchCoinMeta(
       const res = await fetch(`${rpc}/rpc/v1/view`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ function: fn, type_arguments: [coinType], arguments: [] }),
+        body: JSON.stringify({
+          function: fn,
+          type_arguments: [coinType],
+          arguments: [],
+        }),
       });
       if (!res.ok) return null;
       const j = (await res.json()) as { result?: unknown[] };
@@ -161,30 +160,20 @@ export function hasTokenStore(resources: V2Resource[]): boolean {
   return resources.some((r) => r.type.includes("::token::TokenStore"));
 }
 
-/**
- * Estimate NFT count from TokenStore deposit/withdraw counters.
- * Cannot enumerate individual NFTs — Supra events/table APIs return empty for this wallet.
- */
 export function estimateNftCount(resources: V2Resource[]): number {
   const ts = resources.find((r) => r.type.includes("::token::TokenStore"));
   if (!ts) return 0;
   const dep = parseInt(
-    ((ts.data?.deposit_events as { counter?: string })?.counter) ?? "0", 10
+    ((ts.data?.deposit_events as { counter?: string })?.counter) ?? "0",
+    10
   );
   const with_ = parseInt(
-    ((ts.data?.withdraw_events as { counter?: string })?.counter) ?? "0", 10
+    ((ts.data?.withdraw_events as { counter?: string })?.counter) ?? "0",
+    10
   );
   return Math.max(0, dep - with_);
 }
 
-/**
- * Build StarKey sendTransaction payload.
- * Format verified from real Supra on-chain transactions:
- *   {type:"entry_function_payload", function, type_arguments, arguments}
- *
- * Phase 1 (INCINERATOR_ADDRESS = null): plain coin::transfer to dev
- * Phase 2 (INCINERATOR_ADDRESS set): calls deployed incinerator contract
- */
 export function buildBurnCoinPayload(
   coinType: string,
   rawBalance: string,
@@ -195,7 +184,7 @@ export function buildBurnCoinPayload(
       type: "entry_function_payload",
       function: `${INCINERATOR_ADDRESS}::incinerator::burn_coin`,
       type_arguments: [coinType],
-      arguments: [INCINERATOR_ADDRESS, rawBalance],
+      arguments: [INCINERATOR_ADDRESS],
     };
   }
   return {
@@ -216,23 +205,74 @@ export function buildBurnEmptySlotPayload(coinType: string): object | null {
   };
 }
 
-export async function submitTransaction(payload: object): Promise<{ hash: string }> {
+export async function submitTransaction(
+  payload: object
+): Promise<{ hash: string }> {
   type StarKeyProvider = {
     supra: {
-      sendTransaction: (p: object) => Promise<string | { hash?: string; txHash?: string }>;
+      sendTransaction: (
+        p: object
+      ) => Promise<string | { hash?: string; txHash?: string }>;
     };
   };
   const starkey = (window as Window & { starkey?: StarKeyProvider }).starkey;
   if (!starkey?.supra?.sendTransaction) {
-    throw new Error("StarKey wallet not found. Please install it from starkey.network.");
+    throw new Error(
+      "StarKey wallet not found. Please install it from starkey.network."
+    );
   }
   const result = await starkey.supra.sendTransaction(payload);
   if (typeof result === "string") return { hash: result };
   return { hash: result.hash ?? result.txHash ?? String(result) };
 }
 
-export function getExplorerTxUrl(txHash: string, network: "mainnet" | "testnet"): string {
+export async function burnAssets(
+  assets: Array<{
+    type: "fungible" | "nft";
+    coinType?: string;
+    objectAddress?: string;
+    rawBalance?: string;
+    estimatedRebate: number;
+    isDeadSlot?: boolean;
+  }>
+): Promise<{ txHash: string; totalDevFeeOctas: number }> {
+  let lastHash = "";
+  let totalDevFeeOctas = 0;
+
+  for (const asset of assets) {
+    const { devFeeOctas } = calculateFee(asset.estimatedRebate);
+    totalDevFeeOctas += devFeeOctas;
+
+    let payload: object | null = null;
+
+    if (asset.type === "fungible" && asset.coinType) {
+      if (asset.isDeadSlot) {
+        payload = buildBurnEmptySlotPayload(asset.coinType);
+      } else if (asset.rawBalance) {
+        payload = buildBurnCoinPayload(
+          asset.coinType,
+          asset.rawBalance,
+          devFeeOctas
+        );
+      }
+    }
+
+    if (!payload) continue;
+
+    const result = await submitTransaction(payload);
+    lastHash = result.hash;
+  }
+
+  return { txHash: lastHash, totalDevFeeOctas };
+}
+
+export function getExplorerTxUrl(
+  txHash: string,
+  network: "mainnet" | "testnet"
+): string {
   const base =
-    network === "mainnet" ? "https://suprascan.io/tx" : "https://testnet.suprascan.io/tx";
+    network === "mainnet"
+      ? "https://suprascan.io/tx"
+      : "https://testnet.suprascan.io/tx";
   return `${base}/${txHash}`;
 }
