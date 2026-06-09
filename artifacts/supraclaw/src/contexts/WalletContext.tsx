@@ -20,8 +20,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string | null>(null);
   const [network, setNetwork] = useState<Network>("mainnet");
   const [balance, setBalance] = useState<number | null>(null);
+  const [isStarKeyInstalled, setIsStarKeyInstalled] = useState(
+    typeof window !== "undefined" && !!(window as any).starkey?.supra
+  );
 
-  const isStarKeyInstalled = typeof window !== "undefined" && !!(window as any).starkey?.supra;
+  // Browser extensions inject asynchronously — recheck after mount
+  useEffect(() => {
+    const check = () => {
+      if ((window as any).starkey?.supra) setIsStarKeyInstalled(true);
+    };
+    check();
+    const t1 = setTimeout(check, 500);
+    const t2 = setTimeout(check, 1500);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, []);
 
   useEffect(() => {
     if (!isStarKeyInstalled) return;
@@ -43,7 +55,6 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setNetwork(net.toLowerCase().includes("test") ? "testnet" : "mainnet");
     });
 
-    // Check if already connected
     starkey.supra.account().then((accounts: string[]) => {
       if (accounts && accounts.length > 0) {
         setAddress(accounts[0]);
