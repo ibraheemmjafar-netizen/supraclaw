@@ -45,24 +45,63 @@ export interface BurnableAsset {
 
 const MOCK_ASSETS: BurnableAsset[] = [
   {
-    id: "m1", name: "SUPRA OG", symbol: "OG", balance: 0.008023,
-    rawBalance: "8023", decimals: 6, estimatedRebate: SUPRA_PER_SLOT,
-    type: "fungible", collection: "", isDeadSlot: false,
-    coinType: "0xd0f37da5c7a0104d8cb161e1ac1e101f90b702c18081b76b62f20137bf40fd0b::OG::OG",
+    id: "m1",
+    name: "SUPRA OG",
+    symbol: "OG",
+    balance: 0.008023,
+    rawBalance: "8023",
+    decimals: 6,
+    estimatedRebate: SUPRA_PER_SLOT,
+    type: "fungible",
+    collection: "",
+    isDeadSlot: false,
+    coinType:
+      "0xd0f37da5c7a0104d8cb161e1ac1e101f90b702c18081b76b62f20137bf40fd0b::OG::OG",
     objectAddress: "",
   },
   {
-    id: "m2", name: "Rez Dawgz", symbol: "DAWGZ", balance: 131555.432,
-    rawBalance: "131555432078", decimals: 6, estimatedRebate: SUPRA_PER_SLOT,
-    type: "fungible", collection: "", isDeadSlot: false,
-    coinType: "0xb8e94e7204d8eeb565a653d262ae6f7434a3a452e2aaf624810b33dfa3b64d09::DAWGZ::DAWGZ",
+    id: "m2",
+    name: "Rez Dawgz",
+    symbol: "DAWGZ",
+    balance: 131555.432,
+    rawBalance: "131555432078",
+    decimals: 6,
+    estimatedRebate: SUPRA_PER_SLOT,
+    type: "fungible",
+    collection: "",
+    isDeadSlot: false,
+    coinType:
+      "0xb8e94e7204d8eeb565a653d262ae6f7434a3a452e2aaf624810b33dfa3b64d09::DAWGZ::DAWGZ",
     objectAddress: "",
   },
   {
-    id: "m3", name: "LEO", symbol: "LEO", balance: 0,
-    rawBalance: "0", decimals: 6, estimatedRebate: SUPRA_PER_SLOT,
-    type: "fungible", collection: "", isDeadSlot: true,
-    coinType: "0x83e6ebf0e08121734b117daf65677c77185e151114364f7c53bc2366f2c64a12::LEO::LEO",
+    id: "m3",
+    name: "LEO",
+    symbol: "LEO",
+    balance: 0,
+    rawBalance: "0",
+    decimals: 6,
+    estimatedRebate: SUPRA_PER_SLOT,
+    type: "fungible",
+    collection: "",
+    isDeadSlot: true,
+    coinType:
+      "0x83e6ebf0e08121734b117daf65677c77185e151114364f7c53bc2366f2c64a12::LEO::LEO",
+    objectAddress: "",
+  },
+  {
+    id: "m4",
+    name: "JOSH",
+    symbol: "JOSH",
+    balance: 9720.872,
+    rawBalance: "9720872383",
+    decimals: 6,
+    estimatedRebate: SUPRA_PER_SLOT,
+    type: "fungible",
+    collection: "",
+    isDeadSlot: false,
+    coinType:
+      "0x45a6e2f52f53f5c4eca5cca16de4b68e3c4ea0add28e1dbb29e8b3ef32fa0d5b::JOSH::JOSH",
     objectAddress: "",
   },
 ];
@@ -91,46 +130,68 @@ export function useSupraRpc() {
       const resources = await fetchAccountResources(address, network);
       console.log(`[supraclaw] ${resources.length} total resources`);
 
+      // Set NFT count immediately from resources — before slow meta fetches
+      const estNfts = hasTokenStore(resources) ? estimateNftCount(resources) : 0;
+      console.log(`[supraclaw] ~${estNfts} NFTs estimated`);
+      setNftCount(estNfts);
+
       const coinStores = getCoinStoreResources(resources);
       console.log(`[supraclaw] ${coinStores.length} CoinStores (incl. dead slots)`);
 
-      const fungibles: BurnableAsset[] = await Promise.all(
-        coinStores.map(async (r, i): Promise<BurnableAsset> => {
-          const coinType = extractCoinType(r)!;
-          const rawBal = getCoinBalance(r);
-          const dead = isDeadSlot(r);
-          const fb = coinTypeName(coinType);
+      // Build stub assets immediately so UI shows token count right away
+      const stubs: BurnableAsset[] = coinStores.map((r, i) => {
+        const coinType = extractCoinType(r)!;
+        const rawBal = getCoinBalance(r);
+        const fb = coinTypeName(coinType);
+        return {
+          id: `coin-${i}-${coinType}`,
+          name: fb,
+          symbol: fb,
+          balance: rawBal / 1e6,
+          rawBalance: rawBal.toString(),
+          decimals: 6,
+          estimatedRebate: SUPRA_PER_SLOT,
+          type: "fungible" as const,
+          collection: "",
+          coinType,
+          objectAddress: "",
+          isDeadSlot: isDeadSlot(r),
+        };
+      });
+      setAssets(stubs);
 
-          const meta = await fetchCoinMeta(coinType, network).catch(() => ({
-            name: fb, symbol: fb, decimals: 6,
-          }));
+      // Fetch metadata in small batches to avoid 429 rate limiting
+      const BATCH = 8;
+      const enriched = [...stubs];
+      for (let start = 0; start < coinStores.length; start += BATCH) {
+        const slice = coinStores.slice(start, start + BATCH);
+        await Promise.all(
+          slice.map(async (r, j) => {
+            const idx = start + j;
+            const coinType = extractCoinType(r)!;
+            const rawBal = getCoinBalance(r);
+            const fb = coinTypeName(coinType);
+            const meta = await fetchCoinMeta(coinType, network).catch(() => ({
+              name: fb,
+              symbol: fb,
+              decimals: 6,
+            }));
+            enriched[idx] = {
+              ...enriched[idx],
+              name: meta.name,
+              symbol: meta.symbol,
+              balance: rawBal / Math.pow(10, meta.decimals),
+              decimals: meta.decimals,
+            };
+          })
+        );
+        setAssets([...enriched]);
+        if (start + BATCH < coinStores.length) {
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      }
 
-          return {
-            id: `coin-${i}-${coinType}`,
-            name: meta.name,
-            symbol: meta.symbol,
-            balance: rawBal / Math.pow(10, meta.decimals),
-            rawBalance: rawBal.toString(),
-            decimals: meta.decimals,
-            estimatedRebate: SUPRA_PER_SLOT,
-            type: "fungible",
-            collection: "",
-            coinType,
-            objectAddress: "",
-            isDeadSlot: dead,
-          };
-        })
-      );
-
-      // NFT count: deposit_events.counter − withdraw_events.counter
-      // Cannot list individual NFTs — Supra events/table APIs return empty for this wallet
-      const estNfts = hasTokenStore(resources) ? estimateNftCount(resources) : 0;
-      console.log(`[supraclaw] ~${estNfts} NFTs estimated`);
-
-      setAssets(fungibles);
-      setNftCount(estNfts);
-
-      if (fungibles.length === 0) {
+      if (stubs.length === 0) {
         setScanError("No token slots found.");
       }
     } catch (err) {
@@ -142,10 +203,13 @@ export function useSupraRpc() {
     }
   }, [address, network, connected]);
 
-  useEffect(() => { scanWallet(); }, [scanWallet]);
+  useEffect(() => {
+    scanWallet();
+  }, [scanWallet]);
 
   const tokens = assets.filter((a) => a.type === "fungible");
   const nfts = assets.filter((a) => a.type === "nft");
+
   const removeAssets = (ids: string[]) =>
     setAssets((prev) => prev.filter((a) => !ids.includes(a.id)));
 
